@@ -1,0 +1,112 @@
+name: PR Age Notification
+
+on:
+  workflow_dispatch:
+  pull_request:
+    branches: [ main, "IR-*" ] # Quoted IR-* to prevent globbing errors
+  schedule:
+    - cron: "*/5 * * * *"
+
+permissions:
+  contents: read
+  pull-requests: read
+
+jobs:
+  notify-old-prs:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Central Repo
+        uses: actions/checkout@v4
+
+      - name: Run Centralized Notification Script
+        env:
+          GH_TOKEN: ${{ secrets.ORG_WIDE_PAT }}
+          SMTP_SERVER: "smtprelay1.thermofisher.com"
+        shell: bash
+        run: |
+          cat <<'PYTHON' > central_notifier.py
+          import json
+          import os
+          import smtplib
+          import urllib.request
+          from email.mime.text import MIMEText
+          from email.mime.multipart import MIMEMultipart
+          from datetime import datetime, timezone
+
+          def load_json(filename):
+              try:
+                  with open(filename, 'r') as f:
+                      return json.load(f)
+              except Exception as e:
+                  print(f"Error loading {filename}: {e}")
+                  exit(1)
+
+          def get_prs(repo_path, token):
+              url = f"https://api.github.com/repos/{repo_path}/pulls?state=open"
+              req = urllib.request.Request(url)
+              req.add_header("Authorization", f"Bearer {token}")
+              req.add_header("Accept", "application/vnd.github+json")
+              
+              try:
+                  with urllib.request.urlopen(req) as response:
+                      return json.loads(response.read().decode())
+              except Exception as e:
+                  print(f"Failed to fetch PRs for {repo_path}: {e}")
+                  return []
+
+          # 1. Configuration
+          target_repos = load_json('repos.json')
+          email_map = load_json('.github/pr-email-map.json')
+          gh_token = os.environ.get("GH_TOKEN")
+          threshold_hours = 48
+          now = datetime.now(timezone.utc)
+          all_notifications = {}
+
+          for repo_path in target_repos:
+              print(f"Checking {repo_path}...")
+              prs = get_prs(repo_path, gh_token)
+              
+              for pr in prs:
+                  # GitHub API uses 'created_at' and ISO format
+                  created_at = datetime.fromisoformat(pr['created_at'].replace('Z', '+00:00'))
+                  age_hours = (now - created_at).total_seconds() / 3600
+                  
+                  if age_hours > threshold_hours and not pr.get('draft', False):
+                      user = pr['user']['login']
+                      email = email_map.get(user)
+                      
+                      if email:
+                          if email not in all_notifications: all_notifications[email] = []
+                          all_notifications[email].append({
+                              "title": pr['title'],
+                              "url": pr['html_url'],
+                              "repo": repo_path,
+                              "created": pr['created_at']
+                          })
+
+          # 2. Send Emails
+          if not all_notifications:
+              print("No old PRs found.")
+              exit(0)
+
+          for email, pr_list in all_notifications.items():
+              msg = MIMEMultipart()
+              msg['From'] = "github-actions@thermofisher.com"
+              msg['To'] = email
+              msg['Subject'] = f"Reminder: {len(pr_list)} PR(s) Pending Review (>48h)"
+
+              body = "Hello,\n\nThe following Pull Requests have been open for more than 48 hours:\n\n"
+              for pr in pr_list:
+                  body += f"- [{pr['repo']}] {pr['title']}\n"
+                  body += f"  Link: {pr['url']}\n"
+                  body += f"  Created: {pr['created']}\n\n"
+              
+              msg.attach(MIMEText(body, 'plain'))
+              try:
+                  with smtplib.SMTP(os.environ["SMTP_SERVER"], 25) as server:
+                      server.send_message(msg)
+                  print(f"Sent summary to {email}")
+              except Exception as e:
+                  print(f"Failed to send to {email}: {e}")
+          PYTHON
+          python3 central_notifier.py
